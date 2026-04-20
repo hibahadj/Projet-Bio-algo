@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# PDF du devoir (ne pas pousser)
+/Devoir1-BioAlgo2026 (1).pdf
+
+# Optionnel: ignorer tous les PDF
+# *.pdf
