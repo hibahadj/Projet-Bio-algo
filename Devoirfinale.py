@@ -914,6 +914,8 @@ def compare_algorithms_same_inputs() -> None:
     # On exécute en mode silencieux pour éviter de fausser les temps avec les prints.
     naive_results: Dict[str, List[int]] = {}
     bm_results: Dict[str, List[int]] = {}
+    naive_comparisons_by_pattern: Dict[str, int] = {}
+    bm_comparisons_by_pattern: Dict[str, int] = {}
     naive_comparisons_total = 0
     bm_comparisons_total = 0
 
@@ -921,6 +923,7 @@ def compare_algorithms_same_inputs() -> None:
     for p in patterns:
         occ, comps = _run_silently(naive_search, text, p)
         naive_results[p] = occ
+        naive_comparisons_by_pattern[p] = comps
         naive_comparisons_total += comps
     naive_ms = (time.perf_counter() - t0) * 1000
 
@@ -928,6 +931,7 @@ def compare_algorithms_same_inputs() -> None:
     for p in patterns:
         occ, comps = _run_silently(boyer_moore_search, text, p)
         bm_results[p] = occ
+        bm_comparisons_by_pattern[p] = comps
         bm_comparisons_total += comps
     bm_ms = (time.perf_counter() - t0) * 1000
 
@@ -952,11 +956,11 @@ def compare_algorithms_same_inputs() -> None:
     print(f"  Commentz-W  : {cw_ms:.2f} ms | occ_total={total_occ(cw_results)}")
     print(f"  Wu-Manber   : {wm_ms:.2f} ms | occ_total={total_occ(wm_results)}")
 
-    print('\nDétails par motif (positions) :')
+    print('\nDétails par motif (positions + comparaisons pour les algos mono-motif) :')
     for p in patterns:
         print(f"\nMotif '{p}':")
-        print(f"  Naïf        : {naive_results.get(p, [])}")
-        print(f"  Boyer-Moore : {bm_results.get(p, [])}")
+        print(f"  Naïf        : {naive_results.get(p, [])} | comparaisons={naive_comparisons_by_pattern.get(p, 0)}")
+        print(f"  Boyer-Moore : {bm_results.get(p, [])} | comparaisons={bm_comparisons_by_pattern.get(p, 0)}")
         print(f"  Aho-Corasick: {ac_results.get(p, [])}")
         print(f"  Commentz-W  : {cw_results.get(p, [])}")
         print(f"  Wu-Manber   : {wm_results.get(p, [])}")

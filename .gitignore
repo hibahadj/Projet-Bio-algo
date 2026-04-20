@@ -7,3 +7,6 @@ __pycache__/
 
 # Optionnel: ignorer tous les PDF
 # *.pdf
+
+# Fichiers temporaires VS Code
+tempCodeRunnerFile.*
