@@ -3,9 +3,64 @@
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 import tkinter as tk
+import random
+import string
 import time
 import io
 from contextlib import redirect_stdout
+
+
+def _safe_input(prompt: str = "") -> str:
+    """Input robuste pour VS Code/Windows: Ctrl+C est capturé immédiatement.
+
+    Sur certains terminaux Windows, `input()` peut retarder KeyboardInterrupt
+    jusqu'à une frappe supplémentaire. Ici on lit caractère-par-caractère via
+    `msvcrt` et on lève KeyboardInterrupt dès '\x03'.
+    """
+    import sys
+
+    if sys.platform != "win32":
+        return input(prompt)
+
+    try:
+        import msvcrt  # type: ignore
+    except Exception:
+        return input(prompt)
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    buf: List[str] = []
+    while True:
+        ch = msvcrt.getwch()
+
+        # Ctrl+C
+        if ch == "\x03":
+            raise KeyboardInterrupt
+
+        # Enter
+        if ch in ("\r", "\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return "".join(buf)
+
+        # Backspace
+        if ch == "\b":
+            if buf:
+                buf.pop()
+                # Efface le dernier caractère à l'écran
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+
+        # Ignore touches spéciales (flèches, F1...) qui arrivent en deux temps
+        if ch in ("\x00", "\xe0"):
+            _ = msvcrt.getwch()
+            continue
+
+        buf.append(ch)
+        sys.stdout.write(ch)
+        sys.stdout.flush()
 
 ######## PARTIE 1 : BOYER-MOORE ###############
 
@@ -467,20 +522,11 @@ class AhoCorasick:
 
 
 def read_patterns() -> List[str]:
-    print("Entrez les motifs Aho-Corasick, un par ligne. Laissez une ligne vide pour terminer.")
-    patterns: List[str] = []
-    index = 1
-    while True:
-        motif = input(f"Motif {index} = ")
-        if motif == "":
-            break
-        patterns.append(motif)
-        index += 1
-    return patterns
+    return read_patterns_for('Aho-Corasick')
 
 
 def read_single_pattern() -> str:
-    motif = input("Motif = ").strip()
+    motif = _safe_input("Motif = ").strip()
     return motif
 
 
@@ -489,7 +535,7 @@ def read_patterns_for(algorithm_name: str) -> List[str]:
     patterns: List[str] = []
     index = 1
     while True:
-        motif = input(f"Motif {index} = ").strip()
+        motif = _safe_input(f"Motif {index} = ").strip()
         if motif == "":
             break
         patterns.append(motif)
@@ -885,6 +931,265 @@ def _run_silently(func, *args, **kwargs):
         return func(*args, **kwargs)
 
 
+def _format_table(headers: List[str], rows: List[List[object]]) -> str:
+    str_rows = [[str(cell) for cell in row] for row in rows]
+    widths = [len(h) for h in headers]
+    for row in str_rows:
+        for i, cell in enumerate(row):
+            if i < len(widths):
+                widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(parts: List[str]) -> str:
+        return " | ".join(parts[i].ljust(widths[i]) for i in range(len(widths)))
+
+    out = []
+    out.append(fmt_row(headers))
+    out.append("-+-".join("-" * w for w in widths))
+    for row in str_rows:
+        out.append(fmt_row(row))
+    return "\n".join(out)
+
+
+def _bench_ms(fn, *args, repeats: int = 3, **kwargs) -> Tuple[float, float]:
+    times: List[float] = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn(*args, **kwargs)
+        times.append(time.perf_counter() - t0)
+    return min(times) * 1000, (sum(times) / len(times)) * 1000
+
+
+def _avg(values: List[float]) -> float:
+    return (sum(values) / len(values)) if values else 0.0
+
+
+def _slope_ms_per_char(sizes: List[int], times_ms: List[float]) -> float:
+    """Pente approx. entre le premier et le dernier point (ms/caractère)."""
+    if len(sizes) < 2 or len(times_ms) < 2:
+        return 0.0
+    dn = float(sizes[-1] - sizes[0])
+    if dn == 0:
+        return 0.0
+    return (times_ms[-1] - times_ms[0]) / dn
+
+
+def _speedup(a_ms: float, b_ms: float) -> float:
+    """Combien de fois A est plus lent que B (A/B)."""
+    if b_ms <= 0:
+        return float('inf')
+    return a_ms / b_ms
+
+
+def _ascii_curve(title: str, sizes: List[int], times_ms: List[float]) -> None:
+    print(title)
+    if not sizes or not times_ms:
+        print('  (aucune donnée)\n')
+        return
+    max_t = max(times_ms)
+    scale = 40 / max_t if max_t > 0 else 1
+    for n, t in zip(sizes, times_ms):
+        bar = '#' * max(1, int(t * scale))
+        print(f"  n={n:<6d} {t:>10.6f} ms | {bar}")
+    print()
+
+
+def _plot_curves(
+    title: str,
+    sizes: List[int],
+    series: Dict[str, List[float]],
+    ylabel: str,
+    filename: str | None = None,
+) -> None:
+    """Affiche un graphique (et l'enregistre en PNG si filename est fourni)."""
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ModuleNotFoundError:
+        print("[Graph] matplotlib n'est pas installé. Installe-le avec: pip install matplotlib")
+        return
+
+    from pathlib import Path
+
+    def _unique_path(path: Path) -> Path:
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        parent = path.parent
+        i = 2
+        while True:
+            candidate = parent / f"{stem}_{i}{suffix}"
+            if not candidate.exists():
+                return candidate
+            i += 1
+
+    fig, ax = plt.subplots()
+    for label, values in series.items():
+        if len(values) != len(sizes):
+            continue
+        ax.plot(sizes, values, marker='o', label=label)
+
+    ax.set_title(title)
+    ax.set_xlabel('Taille du texte (n)')
+    ax.set_ylabel(ylabel)
+    ax.grid(True, linestyle='--', alpha=0.4)
+    if len(series) > 1:
+        ax.legend()
+
+    if filename:
+        graphs_dir = Path(__file__).resolve().parent / 'graphs'
+        graphs_dir.mkdir(parents=True, exist_ok=True)
+        base_path = graphs_dir / filename
+        out_path = _unique_path(base_path)
+        fig.savefig(out_path, dpi=160, bbox_inches='tight')
+        print(f"[Graph] Sauvegardé: {out_path}")
+
+    # Non-bloquant: laisse les fenêtres ouvertes pendant que le programme continue.
+    plt.show(block=False)
+    plt.pause(0.001)
+
+
+def _generate_patterns(k: int, L: int, rng, alphabet: str) -> List[str]:
+    return [''.join(rng.choice(alphabet) for _ in range(L)) for _ in range(k)]
+
+
+def _generate_text_with_embedded(text_len: int, patterns: List[str], rng, alphabet: str) -> str:
+    text_list = [rng.choice(alphabet) for _ in range(text_len)]
+    for pat in patterns:
+        if len(pat) > text_len:
+            continue
+        pos = rng.randrange(0, text_len - len(pat) + 1)
+        text_list[pos:pos + len(pat)] = list(pat)
+    return ''.join(text_list)
+
+
+def aho_corasick_search_multiple_stats(text: str, patterns: List[str]) -> Tuple[Dict[str, List[int]], int]:
+    automaton = AhoCorasick()
+    for pattern in patterns:
+        automaton.add_pattern(pattern)
+    automaton.build_automaton()
+
+    node = automaton.root
+    results: Dict[str, List[int]] = {p: [] for p in patterns}
+    comparisons = 0
+
+    for index, char in enumerate(text):
+        # On compte chaque tentative de transition / test de transition comme une comparaison.
+        while node is not automaton.root and node.get_transition(char) is None:
+            comparisons += 1
+            node = node.fail  # type: ignore[assignment]
+
+        comparisons += 1
+        next_node = node.get_transition(char)
+        if next_node is not None:
+            node = next_node
+        else:
+            node = automaton.root
+
+        if node.output:
+            for pat in node.output:
+                start = index - len(pat) + 1
+                results.setdefault(pat, []).append(start)
+
+    for p in results:
+        results[p] = sorted(set(results[p]))
+    return results, comparisons
+
+
+def commentz_walter_stats(text: str, patterns: List[str]) -> Tuple[Dict[str, List[int]], int]:
+    if not patterns or not text:
+        return {p: [] for p in patterns}, 0
+
+    root = cw_build_trie(patterns)
+    cw_build_fail_links(root)
+    shift1, shift2, min_len = cw_build_shift_tables(patterns)
+
+    results: Dict[str, List[int]] = {p: [] for p in patterns}
+    comparisons = 0
+
+    n = len(text)
+    pos = min_len - 1
+
+    while pos < n:
+        node = root
+        j = pos
+        while j >= 0:
+            ch = text[j]
+
+            while node is not root and ch not in node.children:
+                comparisons += 1
+                node = node.fail  # type: ignore[assignment]
+
+            comparisons += 1
+            if ch in node.children:
+                node = node.children[ch]
+            else:
+                break
+
+            for pat in node.output:
+                results[pat].append(j)
+
+            j -= 1
+
+        next_char = text[pos] if pos < n else None
+        s1 = shift1.get(next_char, min_len) if next_char else min_len
+        s1 = max(1, s1)
+        s2 = shift2["_default"]
+        s3 = min_len
+        pos += max(s1, s2, s3)
+
+    for p in results:
+        results[p] = sorted(set(results[p]))
+    return results, comparisons
+
+
+def wu_manber_search_stats(text: str, patterns: List[str], B: int = 2) -> Tuple[Dict[str, List[int]], int]:
+    if not text:
+        return {p: [] for p in patterns}, 0
+    if not patterns:
+        return {}, 0
+
+    m, B, shift_default, shift, hash_table, prefix_table = wu_manber_preprocess(patterns, B=B)
+    results: Dict[str, List[int]] = {p: [] for p in patterns}
+    comparisons = 0
+
+    n = len(text)
+    i = m - 1
+    while i < n:
+        comparisons += 1  # lookup shift sur le bloc suffixe
+        block = text[i - B + 1:i + 1]
+        s = shift.get(block, shift_default)
+        window_start = i - m + 1
+
+        if s > 0:
+            i += s
+            continue
+
+        candidates = hash_table.get(block, [])
+        prefix_block = text[window_start:window_start + B]
+        allowed = set(prefix_table.get(prefix_block, []))
+
+        for pat in candidates:
+            if pat not in allowed:
+                continue
+            # Comparaison caractère par caractère pour compter les comparaisons.
+            ok = True
+            if window_start < 0 or window_start + len(pat) > n:
+                continue
+            for a, b in zip(pat, text[window_start:window_start + len(pat)]):
+                comparisons += 1
+                if a != b:
+                    ok = False
+                    break
+            if ok:
+                results[pat].append(window_start)
+
+        i += 1
+
+    for p in results:
+        results[p] = sorted(set(results[p]))
+    return results, comparisons
+
+
 def aho_corasick_search_multiple(text: str, patterns: List[str]) -> Dict[str, List[int]]:
     automaton = AhoCorasick()
     for pattern in patterns:
@@ -900,130 +1205,308 @@ def aho_corasick_search_multiple(text: str, patterns: List[str]) -> Dict[str, Li
     return results
 
 
-def compare_algorithms_same_inputs() -> None:
-    print('\n--- Comparaison sur le même texte et les mêmes motifs ---')
-    text = input('Texte T = ')
-    patterns = read_patterns_for('Comparaison (mêmes motifs)')
-    if not patterns:
-        print('Aucun motif fourni. Retour au menu.\n')
-        return
+def run_performance_tests_cw_vs_ac() -> None:
+    print('\n--- Tests de performance : Commentz-Walter vs Aho-Corasick ---')
+    print('Format: tableau (taille, comparaisons, temps) + courbes (ASCII + matplotlib).')
 
-    print('\nRésumé (temps min sur 1 exécution) :')
+    seed = time.time_ns()
+    rng = random.Random(seed)
+    alphabet = string.ascii_uppercase
 
-    # Naïf et BM sont mono-motif → on les applique à chaque motif.
-    # On exécute en mode silencieux pour éviter de fausser les temps avec les prints.
-    naive_results: Dict[str, List[int]] = {}
-    bm_results: Dict[str, List[int]] = {}
-    naive_comparisons_by_pattern: Dict[str, int] = {}
-    bm_comparisons_by_pattern: Dict[str, int] = {}
-    naive_comparisons_total = 0
-    bm_comparisons_total = 0
+    sizes = [50, 100, 200]
+    k = 10
+    L = 8
+    repeats = 5
 
-    t0 = time.perf_counter()
-    for p in patterns:
-        occ, comps = _run_silently(naive_search, text, p)
-        naive_results[p] = occ
-        naive_comparisons_by_pattern[p] = comps
-        naive_comparisons_total += comps
-    naive_ms = (time.perf_counter() - t0) * 1000
+    print('\nÉtapes du test:')
+    print('1) Générer k motifs aléatoires (seed aléatoire affiché pour traçabilité).')
+    print('2) Pour chaque taille n: générer un texte aléatoire et y insérer les motifs.')
+    print('3) Mesurer le temps (min sur plusieurs répétitions) et compter des opérations.')
+    print('4) Afficher tableaux + courbes et sauvegarder les figures.\n')
+    print(f'Paramètres: tailles={sizes}, k={k}, L={L}, répétitions={repeats}, alphabet=A-Z, seed={seed}')
 
-    t0 = time.perf_counter()
-    for p in patterns:
-        occ, comps = _run_silently(boyer_moore_search, text, p)
-        bm_results[p] = occ
-        bm_comparisons_by_pattern[p] = comps
-        bm_comparisons_total += comps
-    bm_ms = (time.perf_counter() - t0) * 1000
+    patterns = _generate_patterns(k, L, rng, alphabet)
 
-    t0 = time.perf_counter()
-    ac_results = aho_corasick_search_multiple(text, patterns)
-    ac_ms = (time.perf_counter() - t0) * 1000
+    rows: List[List[object]] = []
+    cw_times: List[float] = []
+    ac_times: List[float] = []
+    cw_comps_list: List[int] = []
+    ac_comps_list: List[int] = []
 
-    t0 = time.perf_counter()
-    cw_results = commentz_walter(text, patterns)
-    cw_ms = (time.perf_counter() - t0) * 1000
+    for n in sizes:
+        text = _generate_text_with_embedded(n, patterns, rng, alphabet)
 
-    t0 = time.perf_counter()
-    wm_results = wu_manber_search(text, patterns, B=2, verbose=False)
-    wm_ms = (time.perf_counter() - t0) * 1000
+        # CW
+        _, cw_comps = commentz_walter_stats(text, patterns)
+        cw_min_ms, _ = _bench_ms(commentz_walter, text, patterns, repeats=repeats)
+        cw_times.append(cw_min_ms)
+        cw_comps_list.append(cw_comps)
+        rows.append([n, "CW", cw_comps, f"{cw_min_ms/1000:.6g}"])
 
-    def total_occ(results: Dict[str, List[int]]) -> int:
-        return sum(len(v) for v in results.values())
+        # AC
+        _, ac_comps = aho_corasick_search_multiple_stats(text, patterns)
+        ac_min_ms, _ = _bench_ms(aho_corasick_search_multiple, text, patterns, repeats=repeats)
+        ac_times.append(ac_min_ms)
+        ac_comps_list.append(ac_comps)
+        rows.append([n, "AC", ac_comps, f"{ac_min_ms/1000:.6g}"])
 
-    print(f"  Naïf        : {naive_ms:.2f} ms | occ_total={total_occ(naive_results)} | comparaisons={naive_comparisons_total}")
-    print(f"  Boyer-Moore : {bm_ms:.2f} ms | occ_total={total_occ(bm_results)} | comparaisons={bm_comparisons_total}")
-    print(f"  Aho-Corasick: {ac_ms:.2f} ms | occ_total={total_occ(ac_results)}")
-    print(f"  Commentz-W  : {cw_ms:.2f} ms | occ_total={total_occ(cw_results)}")
-    print(f"  Wu-Manber   : {wm_ms:.2f} ms | occ_total={total_occ(wm_results)}")
+    print(_format_table(["Taille", "Algorithme", "Comparaisons", "Temps (s)"], rows) + '\n')
+    _ascii_curve('Courbe AC (temps ms) vs taille n:', sizes, ac_times)
+    _ascii_curve('Courbe CW (temps ms) vs taille n:', sizes, cw_times)
 
-    print('\nDétails par motif (positions + comparaisons pour les algos mono-motif) :')
-    for p in patterns:
-        print(f"\nMotif '{p}':")
-        print(f"  Naïf        : {naive_results.get(p, [])} | comparaisons={naive_comparisons_by_pattern.get(p, 0)}")
-        print(f"  Boyer-Moore : {bm_results.get(p, [])} | comparaisons={bm_comparisons_by_pattern.get(p, 0)}")
-        print(f"  Aho-Corasick: {ac_results.get(p, [])}")
-        print(f"  Commentz-W  : {cw_results.get(p, [])}")
-        print(f"  Wu-Manber   : {wm_results.get(p, [])}")
+    _plot_curves(
+        'Temps d\'exécution vs taille du texte (CW vs AC)',
+        sizes,
+        {'CW': cw_times, 'AC': ac_times},
+        'Temps (ms)',
+        filename=f'courbe_cw_vs_ac_temps_seed_{seed}.png',
+    )
+    _plot_curves(
+        'Comparaisons vs taille du texte (CW vs AC)',
+        sizes,
+        {'CW': [float(x) for x in cw_comps_list], 'AC': [float(x) for x in ac_comps_list]},
+        'Comparaisons',
+        filename=f'courbe_cw_vs_ac_comparaisons_seed_{seed}.png',
+    )
+    print('Analyse:')
+    print('- Les courbes montrent l’évolution du temps d’exécution selon la taille du texte.')
+    print('- Note: le temps mesuré inclut ici le prétraitement + la recherche (construction automate / trie, etc.).')
+    print('- Note: les "comparaisons" pour AC/CW sont des compteurs d’opérations (approximation), pas un comptage exact caractère-par-caractère.')
+    print(f"- Temps moyen (ms): AC={_avg(ac_times):.6g}, CW={_avg(cw_times):.6g}")
+    print(f"- Tendance (pente approx ms/caractère): AC={_slope_ms_per_char(sizes, ac_times):.6g}, CW={_slope_ms_per_char(sizes, cw_times):.6g}")
+    # Speedups par taille (CW vs AC)
+    print('- Accélération (CW/AC):')
+    for n, t_cw, t_ac in zip(sizes, cw_times, ac_times):
+        print(f"  n={n}: {_speedup(t_cw, t_ac):.2f}x")
+    print("  (Interprétation: >1 ⇒ CW plus lent que AC; <1 ⇒ CW plus rapide que AC)")
 
-    print('\n--- Fin comparaison ---\n')
+    print('- Détails par taille (comparaisons & temps):')
+    for n, c_cw, c_ac, t_cw, t_ac in zip(sizes, cw_comps_list, ac_comps_list, cw_times, ac_times):
+        comp_ratio = _speedup(float(c_cw), float(c_ac))
+        time_ratio = _speedup(t_cw, t_ac)
+        print(f"  n={n}: comps  CW={c_cw}, AC={c_ac} (×{comp_ratio:.2f})")
+        print(f"        temps  CW={t_cw:.6g}ms, AC={t_ac:.6g}ms (×{time_ratio:.2f})")
+    print()
+
+    print('- Interprétation (pourquoi AC est souvent très bon en multi-motifs):')
+    print("  • AC construit un automate des préfixes + liens d’échec, puis parcourt le texte une seule fois.")
+    print("  • Quand le nombre de motifs k augmente, AC amortit bien la recherche car l’automate partage les préfixes.")
+    print("  • Dans ce script, le prétraitement est compté dans le temps; AC peut rester compétitif même ainsi si k est significatif.")
+    print()
+
+    print('- Quand CW peut être compétitif (ou meilleur):')
+    print("  • Si les décalages (shifts) sont grands, CW peut sauter des positions et réduire le nombre d’états visités.")
+    print("  • Si les motifs sont longs / peu corrélés au texte, les échecs arrivent tôt et le saut peut être avantageux.")
+    print()
+
+    print('- Remarques méthodologie (important pour le rapport):')
+    print("  • Les compteurs d’opérations AC/CW ne mesurent pas la même chose (transition/fail vs appartenance au trie) → comparer surtout les tendances.")
+    print(
+        "  • Le temps reporté est le minimum sur plusieurs répétitions (réduit le bruit).\n"
+        "  • Pour isoler la phase de recherche pure, il faudrait prétraiter une seule fois et ne timer que la recherche; ici on mesure l’ensemble (prétraitement + recherche)."
+    )
+    print()
+
+    print('- Conclusion: AC est généralement robuste en multi-motifs; CW dépend davantage de la structure des motifs et des sauts possibles.')
+    print('--- Fin tests perf CW vs AC ---\n')
 
 
 def run_performance_tests_cw_vs_wm() -> None:
-    import random
-    import string
-    import time
-
     print('\n--- Tests de performance : Commentz-Walter vs Wu-Manber ---')
-    print('Note: Wu-Manber est exécuté en mode silencieux pour éviter que les affichages faussent le temps.')
+    print('Format: tableau (taille, comparaisons, temps) + courbes (ASCII + matplotlib).')
 
-    rng = random.Random(42)
+    seed = time.time_ns()
+    rng = random.Random(seed)
     alphabet = string.ascii_uppercase
 
-    test_cases = [
-        {"name": "Petit", "text_len": 2_000, "num_patterns": 20, "pat_len": 8, "repeats": 3},
-        {"name": "Moyen", "text_len": 20_000, "num_patterns": 50, "pat_len": 8, "repeats": 3},
-        {"name": "Grand", "text_len": 100_000, "num_patterns": 100, "pat_len": 8, "repeats": 3},
-    ]
+    sizes = [50, 100, 200]
+    k = 10
+    L = 8
+    repeats = 5
 
-    for case in test_cases:
-        name = case["name"]
-        n = int(case["text_len"])
-        k = int(case["num_patterns"])
-        L = int(case["pat_len"])
-        repeats = int(case["repeats"])
+    print('\nÉtapes du test:')
+    print('1) Générer k motifs aléatoires (seed aléatoire affiché pour traçabilité).')
+    print('2) Pour chaque taille n: générer un texte aléatoire et y insérer les motifs.')
+    print('3) Mesurer le temps (min sur plusieurs répétitions) et compter des opérations.')
+    print('4) Afficher tableaux + courbes et sauvegarder les figures.\n')
+    print(f'Paramètres: tailles={sizes}, k={k}, L={L}, répétitions={repeats}, B=2, alphabet=A-Z, seed={seed}')
 
-        text_list = [rng.choice(alphabet) for _ in range(n)]
+    patterns = _generate_patterns(k, L, rng, alphabet)
 
-        patterns = [''.join(rng.choice(alphabet) for _ in range(L)) for _ in range(k)]
+    rows: List[List[object]] = []
+    cw_times: List[float] = []
+    wm_times: List[float] = []
+    cw_comps_list: List[int] = []
+    wm_comps_list: List[int] = []
 
-        forced = patterns[0]
-        pos = rng.randrange(0, n - L + 1)
-        text_list[pos:pos + L] = list(forced)
-        text = ''.join(text_list)
+    for n in sizes:
+        text = _generate_text_with_embedded(n, patterns, rng, alphabet)
 
-        cw_times: List[float] = []
-        wm_times: List[float] = []
-        cw_total = 0
-        wm_total = 0
+        _, cw_comps = commentz_walter_stats(text, patterns)
+        cw_min_ms, _ = _bench_ms(commentz_walter, text, patterns, repeats=repeats)
+        cw_times.append(cw_min_ms)
+        cw_comps_list.append(cw_comps)
+        rows.append([n, "CW", cw_comps, f"{cw_min_ms/1000:.6g}"])
 
-        for _ in range(repeats):
-            t0 = time.perf_counter()
-            cw_results = commentz_walter(text, patterns)
-            cw_times.append(time.perf_counter() - t0)
-            cw_total = sum(len(v) for v in cw_results.values())
+        _, wm_comps = wu_manber_search_stats(text, patterns, B=2)
+        wm_min_ms, _ = _bench_ms(wu_manber_search, text, patterns, repeats=repeats, B=2, verbose=False)
+        wm_times.append(wm_min_ms)
+        wm_comps_list.append(wm_comps)
+        rows.append([n, "WM", wm_comps, f"{wm_min_ms/1000:.6g}"])
 
-            t0 = time.perf_counter()
-            wm_results = wu_manber_search(text, patterns, B=2, verbose=False)
-            wm_times.append(time.perf_counter() - t0)
-            wm_total = sum(len(v) for v in wm_results.values())
+    print(_format_table(["Taille", "Algorithme", "Comparaisons", "Temps (s)"], rows) + '\n')
+    _ascii_curve('Courbe WM (temps ms) vs taille n:', sizes, wm_times)
+    _ascii_curve('Courbe CW (temps ms) vs taille n:', sizes, cw_times)
 
-        cw_ms = min(cw_times) * 1000
-        wm_ms = min(wm_times) * 1000
-        print(f"\n[{name}] n={n} caractères, |M|={k} motifs, |motif|={L}, répétitions={repeats}")
-        print(f"  CW: {cw_ms:.2f} ms (min), occurrences totales={cw_total}")
-        print(f"  WM: {wm_ms:.2f} ms (min), occurrences totales={wm_total}")
+    _plot_curves(
+        'Temps d\'exécution vs taille du texte (CW vs WM)',
+        sizes,
+        {'CW': cw_times, 'WM': wm_times},
+        'Temps (ms)',
+        filename=f'courbe_cw_vs_wm_temps_seed_{seed}.png',
+    )
+    _plot_curves(
+        'Comparaisons vs taille du texte (CW vs WM)',
+        sizes,
+        {'CW': [float(x) for x in cw_comps_list], 'WM': [float(x) for x in wm_comps_list]},
+        'Comparaisons',
+        filename=f'courbe_cw_vs_wm_comparaisons_seed_{seed}.png',
+    )
+    print('Analyse:')
+    print('- Les courbes montrent l’évolution du temps d’exécution selon la taille du texte.')
+    print('- Note: le temps mesuré inclut ici le prétraitement + la recherche (tables Shift/Hash/Prefix ou trie).')
+    print('- Note: les "comparaisons" CW/WM sont des compteurs d’opérations (approximation) pour comparer des tendances.')
+    print(f"- Temps moyen (ms): WM={_avg(wm_times):.6g}, CW={_avg(cw_times):.6g}")
+    print(f"- Tendance (pente approx ms/caractère): WM={_slope_ms_per_char(sizes, wm_times):.6g}, CW={_slope_ms_per_char(sizes, cw_times):.6g}")
+    print('- Accélération (CW/WM):')
+    for n, t_cw, t_wm in zip(sizes, cw_times, wm_times):
+        print(f"  n={n}: {_speedup(t_cw, t_wm):.2f}x")
 
-    print('\n--- Fin des tests de performance ---\n')
+    print('- Détails par taille (comparaisons & temps):')
+    for n, c_cw, c_wm, t_cw, t_wm in zip(sizes, cw_comps_list, wm_comps_list, cw_times, wm_times):
+        comp_ratio = _speedup(float(c_cw), float(c_wm))
+        time_ratio = _speedup(t_cw, t_wm)
+        print(f"  n={n}: comps  CW={c_cw}, WM={c_wm} (×{comp_ratio:.2f})")
+        print(f"        temps  CW={t_cw:.6g}ms, WM={t_wm:.6g}ms (×{time_ratio:.2f})")
+    print()
+
+    print('- Interprétation (pourquoi WM peut être très rapide):')
+    print("  • WM utilise des tables Shift/Hash/Prefix sur des blocs (ici B=2). Si Shift>0, il saute plusieurs positions.")
+    print("  • Sur texte aléatoire, beaucoup de blocs suffixes ne correspondent à aucun motif → Shift est souvent >0 → gros gains.")
+    print("  • Quand Shift=0, WM vérifie les candidats (comparaisons caractère-par-caractère) → coût local mais limité au nombre de candidats.")
+    print()
+
+    print('- Quand WM peut perdre du terrain:')
+    print("  • Si beaucoup de blocs apparaissent dans les motifs (Hash chargé), on vérifie plus de candidats.")
+    print("  • Si le texte est très répétitif, Shift peut être souvent petit (moins de sauts).")
+    print("  • Le choix de B influence: B trop petit → plus de collisions/candidats; B trop grand → moins flexible si motifs courts.")
+    print()
+
+    print('- Remarques méthodologie (important pour le rapport):')
+    print("  • Les compteurs d’opérations CW/WM ne sont pas identiques (trie/fail vs lookups + vérification) → comparer surtout les tendances.")
+    print(
+        "  • Le temps reporté est le minimum sur plusieurs répétitions (réduit le bruit).\n"
+        "  • Ici on mesure prétraitement + recherche; WM et CW ont des coûts de prétraitement différents."
+    )
+    print()
+
+    print('- Conclusion: WM est souvent excellent sur texte aléatoire grâce aux sauts; CW peut devenir intéressant si ses décalages sont grands et que les motifs/texte favorisent le trie.')
+    print('--- Fin tests perf CW vs WM ---\n')
+
+
+def run_tests_naive_vs_bm() -> None:
+    print('\n--- Test et analyse : Naïf vs Boyer-Moore ---')
+    print('On reporte: tailles (n,m), comparaisons et temps (ms), + courbes (ASCII + matplotlib).')
+
+    seed = time.time_ns()
+    rng = random.Random(seed)
+    alphabet = string.ascii_uppercase
+
+    sizes = [50, 100, 200]
+    m = 8
+    repeats = 10
+
+    print('\nÉtapes du test:')
+    print('1) Générer un motif P de longueur m (seed aléatoire affiché pour traçabilité).')
+    print('2) Pour chaque taille n: générer un texte aléatoire et insérer P au moins une fois.')
+    print('3) Mesurer le temps (min sur plusieurs répétitions) et compter les comparaisons exactes.')
+    print('4) Afficher tableaux + courbes et sauvegarder les figures.\n')
+    print(f'Paramètres: tailles={sizes}, m={m}, répétitions={repeats}, alphabet=A-Z, seed={seed}')
+
+    pattern = ''.join(rng.choice(alphabet) for _ in range(m))
+
+    headers = ["Taille", "Algorithme", "m", "Comparaisons", "Temps (s)"]
+    rows: List[List[object]] = []
+    naive_times: List[float] = []
+    bm_times: List[float] = []
+    naive_comps_list: List[int] = []
+    bm_comps_list: List[int] = []
+
+    for n in sizes:
+        # Texte aléatoire + insertion du motif au moins une fois
+        text = _generate_text_with_embedded(n, [pattern], rng, alphabet)
+
+        occ, naive_comps = _run_silently(naive_search, text, pattern)
+        naive_min_ms, _ = _bench_ms(lambda: _run_silently(naive_search, text, pattern), repeats=repeats)
+        naive_times.append(naive_min_ms)
+        naive_comps_list.append(naive_comps)
+        rows.append([n, "Naïf", m, naive_comps, f"{naive_min_ms/1000:.6g}"])
+
+        occ, bm_comps = _run_silently(boyer_moore_search, text, pattern)
+        bm_min_ms, _ = _bench_ms(lambda: _run_silently(boyer_moore_search, text, pattern), repeats=repeats)
+        bm_times.append(bm_min_ms)
+        bm_comps_list.append(bm_comps)
+        rows.append([n, "BM", m, bm_comps, f"{bm_min_ms/1000:.6g}"])
+
+    print('\n' + _format_table(headers, rows) + '\n')
+    _ascii_curve('Courbe Naïf (temps ms) vs taille n:', sizes, naive_times)
+    _ascii_curve('Courbe BM (temps ms) vs taille n:', sizes, bm_times)
+
+    _plot_curves(
+        'Temps d\'exécution vs taille du texte (Naïf vs BM)',
+        sizes,
+        {'Naïf': naive_times, 'BM': bm_times},
+        'Temps (ms)',
+        filename=f'courbe_naif_vs_bm_temps_seed_{seed}.png',
+    )
+    _plot_curves(
+        'Comparaisons vs taille du texte (Naïf vs BM)',
+        sizes,
+        {'Naïf': [float(x) for x in naive_comps_list], 'BM': [float(x) for x in bm_comps_list]},
+        'Comparaisons',
+        filename=f'courbe_naif_vs_bm_comparaisons_seed_{seed}.png',
+    )
+    print('Analyse:')
+    print('- Les courbes montrent l’évolution du temps d’exécution selon la taille du texte.')
+    print('- Ici, les comparaisons Naïf/BM sont comptées de manière directe (caractère-par-caractère).')
+    print(f"- Temps moyen (ms): Naïf={_avg(naive_times):.6g}, BM={_avg(bm_times):.6g}")
+    print(f"- Tendance (pente approx ms/caractère): Naïf={_slope_ms_per_char(sizes, naive_times):.6g}, BM={_slope_ms_per_char(sizes, bm_times):.6g}")
+    print('- Accélération (Naïf/BM):')
+    for n, t_nv, t_bm in zip(sizes, naive_times, bm_times):
+        print(f"  n={n}: {_speedup(t_nv, t_bm):.2f}x")
+    print('- Détails par taille (comparaisons & temps):')
+    for n, c_nv, c_bm, t_nv, t_bm in zip(sizes, naive_comps_list, bm_comps_list, naive_times, bm_times):
+        comp_ratio = _speedup(float(c_nv), float(c_bm))
+        time_ratio = _speedup(t_nv, t_bm)
+        print(f"  n={n}: comps  Naïf={c_nv}, BM={c_bm} (×{comp_ratio:.2f})")
+        print(f"        temps  Naïf={t_nv:.6g}ms, BM={t_bm:.6g}ms (×{time_ratio:.2f})")
+    print()
+
+    print('- Interprétation (pourquoi BM est souvent meilleur):')
+    print("  • Naïf aligne le motif à chaque position et compare jusqu’à la 1ère différence → beaucoup de comparaisons quand n grandit.")
+    print("  • BM (ici: heuristique du mauvais caractère) compare depuis la fin du motif. En cas d’échec, il peut décaler de plusieurs positions → moins d’alignements testés.")
+    print("  • Sur texte aléatoire (alphabet A–Z), les mismatches arrivent vite et les décalages peuvent être importants, donc BM gagne souvent.")
+    print()
+
+    print('- Quand BM gagne moins (ou peut se rapprocher du naïf):')
+    print("  • Si le texte contient beaucoup de répétitions ou si le motif partage beaucoup de suffixes/prefixes avec le texte, les décalages sont plus petits.")
+    print("  • Ce script force l’insertion du motif au moins une fois: près d’une occurrence, les comparaisons augmentent et l’avantage de BM peut diminuer.")
+    print()
+
+    print('- Remarques méthodologie:')
+    print("  • Le temps reporté est le minimum sur plusieurs répétitions (réduit le bruit mais rend les résultats plus stables).")
+    print("  • Ici BM n’utilise que le mauvais caractère (pas la bonne suffixe), donc le speedup observé est un gain ‘raisonnable’ mais pas le maximum théorique.")
+    print('--- Fin test Naïf vs BM ---\n')
 
 
 def main() -> None:
@@ -1036,9 +1519,10 @@ def main() -> None:
             print('4 - Commentz-Walter')
             print('5 - Wu-Manber')
             print('6 - Tests perf (CW vs Wu-Manber)')
-            print('7 - Comparer (même texte + mêmes motifs)')
+            print('7 - Tests perf (CW vs Aho-Corasick)')
+            print('8 - Tests/Analyse (Naïf vs Boyer-Moore)')
             print('0 - Quitter')
-            choix = input('Votre choix (0 à 7) : ').strip()
+            choix = _safe_input('Votre choix (0 à 8) : ').strip()
 
             if choix == '0':
                 print('Fin du programme.')
@@ -1046,13 +1530,19 @@ def main() -> None:
 
             if choix == '6':
                 run_performance_tests_cw_vs_wm()
-                input('Appuyez sur Entrée pour revenir au menu... ')
+                _safe_input('Appuyez sur Entrée pour revenir au menu... ')
                 print('--- Retour au menu ---\n')
                 continue
 
             if choix == '7':
-                compare_algorithms_same_inputs()
-                input('Appuyez sur Entrée pour revenir au menu... ')
+                run_performance_tests_cw_vs_ac()
+                _safe_input('Appuyez sur Entrée pour revenir au menu... ')
+                print('--- Retour au menu ---\n')
+                continue
+
+            if choix == '8':
+                run_tests_naive_vs_bm()
+                _safe_input('Appuyez sur Entrée pour revenir au menu... ')
                 print('--- Retour au menu ---\n')
                 continue
 
@@ -1060,7 +1550,7 @@ def main() -> None:
                 print('Choix invalide. Veuillez réessayer.\n')
                 continue
 
-            text = input('Texte T = ')
+            text = _safe_input('Texte T = ')
 
             if choix == '1':
                 motif = read_single_pattern()
@@ -1093,7 +1583,7 @@ def main() -> None:
                     continue
                 run_wu_manber(text, patterns)
 
-            input('Appuyez sur Entrée pour revenir au menu... ')
+            _safe_input('Appuyez sur Entrée pour revenir au menu... ')
             print('--- Retour au menu ---\n')
     except KeyboardInterrupt:
         print('\nInterrompu (Ctrl+C). Fin du programme.')
