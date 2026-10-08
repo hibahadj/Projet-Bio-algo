@@ -374,7 +374,7 @@ Therefore, the benchmark results should primarily be interpreted as **performanc
 
 # 👩‍💻 Authors
 
-**Hadjiedj Amel Hiba**
+**Hadjiedj Amel Hiba & Yasmine Benkritly**
 
 USTHB — Faculty of Computer Science
 
